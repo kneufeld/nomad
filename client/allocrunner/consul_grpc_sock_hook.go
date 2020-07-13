@@ -18,41 +18,42 @@ import (
 	"github.com/hashicorp/nomad/nomad/structs/config"
 )
 
-// consulSockHook creates Unix sockets to allow communication from inside a
-// netns to Consul.
+const (
+	consulGRPCSockHookName = "consul_grpc_socket"
+)
+
+// consulGRPCSocketHook creates Unix sockets to allow communication from inside a
+// netns to Consul gRPC endpoint.
 //
-// Noop for allocations without a group Connect stanza.
-type consulSockHook struct {
-	alloc *structs.Allocation
+// Noop for allocations without a group Connect stanza using bridge networking.
+type consulGRPCSocketHook struct {
+	logger hclog.Logger
+	alloc  *structs.Allocation
+	proxy  *grpcSocketProxy
 
-	proxy *sockProxy
-
-	// mu synchronizes group & cancel as they may be mutated and accessed
+	// mu synchronizes proxy as they may be mutated and accessed
 	// concurrently via Prerun, Update, Postrun.
 	mu sync.Mutex
-
-	logger hclog.Logger
 }
 
-func newConsulSockHook(logger hclog.Logger, alloc *structs.Allocation, allocDir *allocdir.AllocDir, config *config.ConsulConfig) *consulSockHook {
-	h := &consulSockHook{
-		alloc: alloc,
-		proxy: newSockProxy(logger, allocDir, config),
+func newConsulGRPCSocketHook(logger hclog.Logger, alloc *structs.Allocation, allocDir *allocdir.AllocDir, config *config.ConsulConfig) *consulGRPCSocketHook {
+	return &consulGRPCSocketHook{
+		alloc:  alloc,
+		proxy:  newSockProxy(logger, allocDir, config),
+		logger: logger.Named(consulGRPCSockHookName),
 	}
-	h.logger = logger.Named(h.Name())
-	return h
 }
 
-func (*consulSockHook) Name() string {
-	return "consul_socket"
+func (*consulGRPCSocketHook) Name() string {
+	return consulGRPCSockHookName
 }
 
 // shouldRun returns true if the Unix socket should be created and proxied.
 // Requires the mutex to be held.
-func (h *consulSockHook) shouldRun() bool {
+func (h *consulGRPCSocketHook) shouldRun() bool {
 	tg := h.alloc.Job.LookupTaskGroup(h.alloc.TaskGroup)
 	for _, s := range tg.Services {
-		if s.Connect.HasSidecar() {
+		if s.Connect.HasSidecar() { // todo(shoenig) check we are in bridge mode
 			return true
 		}
 	}
@@ -60,7 +61,7 @@ func (h *consulSockHook) shouldRun() bool {
 	return false
 }
 
-func (h *consulSockHook) Prerun() error {
+func (h *consulGRPCSocketHook) Prerun() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -73,7 +74,7 @@ func (h *consulSockHook) Prerun() error {
 
 // Update creates a gRPC socket file and proxy if there are any Connect
 // services.
-func (h *consulSockHook) Update(req *interfaces.RunnerUpdateRequest) error {
+func (h *consulGRPCSocketHook) Update(req *interfaces.RunnerUpdateRequest) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -86,7 +87,7 @@ func (h *consulSockHook) Update(req *interfaces.RunnerUpdateRequest) error {
 	return h.proxy.run(h.alloc)
 }
 
-func (h *consulSockHook) Postrun() error {
+func (h *consulGRPCSocketHook) Postrun() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -98,7 +99,8 @@ func (h *consulSockHook) Postrun() error {
 	return nil
 }
 
-type sockProxy struct {
+type grpcSocketProxy struct {
+	logger   hclog.Logger
 	allocDir *allocdir.AllocDir
 	config   *config.ConsulConfig
 
@@ -106,13 +108,11 @@ type sockProxy struct {
 	cancel  func()
 	doneCh  chan struct{}
 	runOnce bool
-
-	logger hclog.Logger
 }
 
-func newSockProxy(logger hclog.Logger, allocDir *allocdir.AllocDir, config *config.ConsulConfig) *sockProxy {
+func newSockProxy(logger hclog.Logger, allocDir *allocdir.AllocDir, config *config.ConsulConfig) *grpcSocketProxy {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &sockProxy{
+	return &grpcSocketProxy{
 		allocDir: allocDir,
 		config:   config,
 		ctx:      ctx,
@@ -126,7 +126,7 @@ func newSockProxy(logger hclog.Logger, allocDir *allocdir.AllocDir, config *conf
 // hasn't been told to stop.
 //
 // NOT safe for concurrent use.
-func (s *sockProxy) run(alloc *structs.Allocation) error {
+func (s *grpcSocketProxy) run(alloc *structs.Allocation) error {
 	// Only run once.
 	if s.runOnce {
 		return nil
@@ -156,20 +156,20 @@ func (s *sockProxy) run(alloc *structs.Allocation) error {
 		destAddr = net.JoinHostPort(host, "8502")
 	}
 
-	hostGRPCSockPath := filepath.Join(s.allocDir.AllocDir, allocdir.AllocGRPCSocket)
+	hostGRPCSocketPath := filepath.Join(s.allocDir.AllocDir, allocdir.AllocGRPCSocket)
 
 	// if the socket already exists we'll try to remove it, but if not then any
 	// other errors will bubble up to the caller here or when we try to listen
-	_, err := os.Stat(hostGRPCSockPath)
+	_, err := os.Stat(hostGRPCSocketPath)
 	if err == nil {
-		err := os.Remove(hostGRPCSockPath)
+		err := os.Remove(hostGRPCSocketPath)
 		if err != nil {
 			return fmt.Errorf(
 				"unable to remove existing unix socket for Consul gRPC endpoint: %v", err)
 		}
 	}
 
-	listener, err := net.Listen("unix", hostGRPCSockPath)
+	listener, err := net.Listen("unix", hostGRPCSocketPath)
 	if err != nil {
 		return fmt.Errorf("unable to create unix socket for Consul gRPC endpoint: %v", err)
 	}
@@ -179,7 +179,7 @@ func (s *sockProxy) run(alloc *structs.Allocation) error {
 	// socket permissions when creating the file, so we must manually call
 	// chmod afterwards.
 	// https://github.com/golang/go/issues/11822
-	if err := os.Chmod(hostGRPCSockPath, os.ModePerm); err != nil {
+	if err := os.Chmod(hostGRPCSocketPath, os.ModePerm); err != nil {
 		return fmt.Errorf("unable to set permissions on unix socket for Consul gRPC endpoint: %v", err)
 	}
 
@@ -195,7 +195,7 @@ func (s *sockProxy) run(alloc *structs.Allocation) error {
 
 // stop the proxy and blocks until the proxy has stopped. Returns an error if
 // the proxy does not exit in a timely fashion.
-func (s *sockProxy) stop() error {
+func (s *grpcSocketProxy) stop() error {
 	s.cancel()
 
 	// If proxy was never run, don't wait for anything to shutdown.
